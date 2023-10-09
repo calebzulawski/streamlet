@@ -1,0 +1,5 @@
+target/
+venv/
+*.egg-info
+*.so
+*.dylib
