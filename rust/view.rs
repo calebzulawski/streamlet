@@ -1,8 +1,16 @@
-use rivulet::{circular_buffer as cbuf, View, ViewMut};
-use serde::{Deserialize, Serialize};
+use rivulet::{
+    splittable::{SplittableView, SplittableViewMut},
+    View, ViewMut,
+};
 
 #[derive(Debug)]
-struct Error(String);
+pub struct Error(String);
+
+impl Error {
+    fn new(message: &str) -> Self {
+        Self(message.to_string())
+    }
+}
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
@@ -22,22 +30,24 @@ impl std::error::Error for Error {
     }
 }
 
-type MapError<T> = rivulet::view::MapError<T, Error, fn(<T as rivulet::View>::Error) -> Error>;
-type BufInput = MapError<rivulet::circular_buffer::Sink<u8>>;
-type BufOutput = MapError<rivulet::circular_buffer::Source<u8>>;
+pub trait PipeImpl {
+    fn tap(&mut self) -> Option<Box<dyn Tap>>;
 
-trait PipelineImpl {
-    fn to_stream(&mut self) -> Option<Box<dyn Stream>>;
-
-    fn split(&mut self) -> Option<(Box<dyn PipelineImpl>, Box<dyn PipelineImpl>)>;
+    fn split(&mut self) -> Option<(Box<dyn PipeImpl>, Box<dyn PipeImpl>)>;
 }
 
-impl<T> PipelineImpl for Option<T>
+pub trait PipeMutImpl: PipeImpl {
+    fn tap_mut(&mut self) -> Option<Box<dyn TapMut>>;
+
+    fn split_mut(&mut self) -> Option<(Box<dyn PipeMutImpl>, Box<dyn PipeMutImpl>)>;
+}
+
+impl<T> PipeImpl for Option<T>
 where
-    T: 'static + rivulet::SplittableView<Item = u8>,
+    T: 'static + SplittableView<Item = u8>,
     T::Error: 'static + std::fmt::Display,
 {
-    fn to_stream(&mut self) -> Option<Box<dyn Stream>> {
+    fn tap(&mut self) -> Option<Box<dyn Tap>> {
         if let Some(p) = self.take() {
             Some(Box::new(
                 p.into_cloneable_view().map_error(Error::from_error),
@@ -47,7 +57,30 @@ where
         }
     }
 
-    fn split(&mut self) -> Option<(Box<dyn PipelineImpl>, Box<dyn PipelineImpl>)> {
+    fn split(&mut self) -> Option<(Box<dyn PipeImpl>, Box<dyn PipeImpl>)> {
+        if let Some(p) = self.take() {
+            let (first, second) = p.sequence();
+            Some((Box::new(Some(first)), Box::new(Some(second))))
+        } else {
+            None
+        }
+    }
+}
+
+impl<T> PipeMutImpl for Option<T>
+where
+    T: 'static + SplittableViewMut<Item = u8>,
+    T::Error: 'static + std::fmt::Display,
+{
+    fn tap_mut(&mut self) -> Option<Box<dyn TapMut>> {
+        if let Some(p) = self.take() {
+            Some(Box::new(p.into_view().map_error(Error::from_error)))
+        } else {
+            None
+        }
+    }
+
+    fn split_mut(&mut self) -> Option<(Box<dyn PipeMutImpl>, Box<dyn PipeMutImpl>)> {
         if let Some(p) = self.take() {
             let (first, second) = p.sequence();
             Some((Box::new(Some(first)), Box::new(Some(second))))
@@ -58,41 +91,53 @@ where
 }
 
 /// A type-erased pipeline component.
-struct Pipeline(Box<dyn PipelineImpl>);
+pub enum Pipe {
+    Const(Box<dyn PipeImpl>),
+    Mut(Box<dyn PipeMutImpl>),
+}
 
-impl Pipeline {
-    fn to_stream(&mut self) -> Option<Box<dyn Stream>> {
-        self.0.to_stream()
+impl Pipe {
+    pub fn tap(&mut self) -> Result<Box<dyn Tap>, Error> {
+        let s = match self {
+            Self::Const(p) => p.tap(),
+            Self::Mut(p) => p.tap(),
+        };
+        s.ok_or_else(|| Error::new("a stream has already been created from this pipe"))
     }
 
-    fn precede(&mut self) -> Option<Self> {
-        if let Some((first, second)) = self.0.split() {
-            self.0 = second;
-            Some(Self(first))
-        } else {
-            None
-        }
+    pub fn mutable_tap(&mut self) -> Result<Box<dyn TapMut>, Error> {
+        let s = match self {
+            Self::Const(_) => return Err(Error::new("this pipe is not mutable")),
+            Self::Mut(p) => p.tap_mut(),
+        };
+        s.ok_or_else(|| Error::new("a stream has already been created from this pipe"))
     }
 
-    fn follow(&mut self) -> Option<Self> {
-        if let Some((first, second)) = self.0.split() {
-            self.0 = first;
-            Some(Self(second))
-        } else {
-            None
+    pub fn split(&mut self) -> Option<(Self, Self)> {
+        match self {
+            Self::Const(p) => p
+                .split()
+                .map(|(first, second)| (Self::Const(first), Self::Const(second))),
+            Self::Mut(p) => p
+                .split_mut()
+                .map(|(first, second)| (Self::Mut(first), Self::Mut(second))),
         }
     }
 }
 
-trait Stream: rivulet::View<Item = u8, Error = Error> {
-    fn duplicate(&self) -> Box<dyn Stream>;
+pub trait Tap: rivulet::View<Item = u8, Error = Error> {
+    fn duplicate(&self) -> Box<dyn Tap>;
 }
 
-impl<T> Stream for T
+impl<T> Tap for T
 where
-    T: 'static + rivulet::View<Item = u8, Error = Error> + Clone,
+    T: 'static + View<Item = u8, Error = Error> + Clone,
 {
-    fn duplicate(&self) -> Box<dyn Stream> {
+    fn duplicate(&self) -> Box<dyn Tap> {
         Box::new(self.clone())
     }
 }
+
+pub trait TapMut: ViewMut<Item = u8, Error = Error> {}
+
+impl<T> TapMut for T where T: 'static + rivulet::ViewMut<Item = u8, Error = Error> {}
